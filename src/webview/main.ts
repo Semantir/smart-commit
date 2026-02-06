@@ -825,8 +825,8 @@ options: { signal: AbortSignal }
 		? `Recent commits:\n- ${state.gitContext.recentCommits.slice(0, 8).join('\n- ')}`
 		: '';
 	const requiredTokenCount = diff.files.length > 10 ? 2 : 1;
-	const changeMagnitude = diff.files.length + Math.round((diff.totalAdditions + diff.totalDeletions) / 200);
-	const minSubjectLength = changeMagnitude >= 10 ? 300 : 0;
+	const minSubjectLength = 80;
+	const maxSubjectLength = 120;
 	const requiredTokens = buildRequiredTokens(rankedFiles.slice(0, 3));
 	const requiredTokenHint = requiredTokens.length
 		? `Subject must include at least ${requiredTokenCount} key item${requiredTokenCount > 1 ? 's' : ''}: ${requiredTokens.join(', ')}`
@@ -834,12 +834,13 @@ options: { signal: AbortSignal }
 
 	const systemPrompt = [
 		'You are a Git commit message generator.',
-		'Return exactly one line, no quotes or code fences.',
-		'Format: type(scope): subject',
+		'Return a subject line, then a blank line, then 8-12 bullet lines.',
+		'No quotes or code fences.',
+		'Subject format: type(scope): subject',
 		`Subject must include at least ${requiredTokenCount} key items (file/module/identifier).`,
 		'Prefer specificity even if longer.',
 		'Include a short action phrase for each key item.',
-		minSubjectLength > 0 ? 'Subject should be 300-400 characters to describe the change.' : '',
+		'Subject should be 80-120 characters.',
 		'Be specific and mention a key file or component.',
 		'Avoid generic phrases like "updated implementation details", "update logic", or "multiple files".',
 	].join(' ');
@@ -849,6 +850,7 @@ options: { signal: AbortSignal }
 		`Suggested scope: ${scopeHint}`,
 		subjectStyle,
 		languageHint,
+		'Body: 8-12 bullet lines with concrete file/module details and action verbs.',
 		requiredTokenHint,
 		'Key changes:',
 		keyFiles || '- (no file details)',
@@ -879,7 +881,7 @@ options: { signal: AbortSignal }
 			const delta = chunk.choices?.[0]?.delta?.content ?? '';
 			if (delta) {
 				content += delta;
-				elements.commitOutput.value = sanitizeCommitMessage(content);
+				elements.commitOutput.value = sanitizeStreamingContent(content);
 			}
 		}
 	} catch (error) {
@@ -897,8 +899,20 @@ options: { signal: AbortSignal }
 			});
 			content = response.choices?.[0]?.message?.content ?? '';
 		} catch {
-			const fallback = generateFallbackMessage(diff, promptConfig);
-			return applyPromptConfig(fallback, promptConfig);
+			const fallback = buildFallbackOutput(diff, promptConfig);
+			const normalized = normalizeCommitMessage({
+				subjectLine: fallback.subjectLine,
+				bodyLines: fallback.bodyLines,
+				typeHint,
+				scopeHint,
+				requiredTokens,
+				requiredTokenCount,
+				minSubjectLength,
+				maxSubjectLength,
+				diff,
+				promptConfig,
+			});
+			return applyPromptConfig(normalized, promptConfig);
 		}
 	}
 
@@ -906,37 +920,64 @@ options: { signal: AbortSignal }
 		throw new Error('Inference aborted');
 	}
 
-	const sanitized = sanitizeCommitMessage(content);
+	const sanitized = sanitizeCommitOutput(content);
 	debugLog('generation', {
-		rawFirstLine: content.split(/\r?\n/).find(line => line.trim().length > 0) ?? '',
-		sanitized,
+		rawFirstLine: sanitized.rawFirstLine,
+		sanitizedSubject: sanitized.subjectLine,
+		bodyLines: sanitized.bodyLines.length,
 		requiredTokenCount,
 		requiredTokens,
 		minSubjectLength,
+		maxSubjectLength,
 		typeHint,
 		scopeHint,
 	});
-	const finalMessage = sanitized || generateFallbackMessage(diff, promptConfig);
+	const fallback = buildFallbackOutput(diff, promptConfig);
+	const baseOutput = sanitized.subjectLine ? sanitized : fallback;
 	const normalized = normalizeCommitMessage({
-		message: finalMessage,
+		subjectLine: baseOutput.subjectLine,
+		bodyLines: baseOutput.bodyLines,
 		typeHint,
 		scopeHint,
 		requiredTokens,
 		requiredTokenCount,
 		minSubjectLength,
+		maxSubjectLength,
 		diff,
 		promptConfig,
 	});
 	return applyPromptConfig(normalized, promptConfig);
 }
 
-function sanitizeCommitMessage(raw: string): string {
+function sanitizeStreamingContent(raw: string): string {
 	if (!raw) {
 		return '';
 	}
-	const firstLine = raw.split(/\r?\n/).find(line => line.trim().length > 0) ?? '';
-	const trimmed = firstLine.replace(/^[-*]\s+/, '').trim();
-	return trimmed.replace(/^["'`]+/, '').replace(/["'`]+$/, '').trim();
+	const cleaned = raw.replace(/```/g, '').replace(/\r/g, '');
+	return cleaned.trimStart();
+}
+
+function sanitizeCommitOutput(raw: string): { subjectLine: string; bodyLines: string[]; rawFirstLine: string } {
+	const output = raw.replace(/```/g, '').replace(/\r/g, '');
+	const lines = output.split('\n').map(line => line.trimEnd());
+	while (lines.length && lines[0].trim().length === 0) {
+		lines.shift();
+	}
+	const rawFirstLine = lines[0] ?? '';
+	const subjectLine = (lines.shift() ?? '')
+		.replace(/^[-*]\s+/, '')
+		.replace(/^["'`]+/, '')
+		.replace(/["'`]+$/, '')
+		.trim();
+	while (lines.length && lines[0].trim().length === 0) {
+		lines.shift();
+	}
+	const bodyLines = lines
+		.map(line => line.trim())
+		.filter(Boolean)
+		.map(line => line.replace(/^[-*•]\s+/, '').trim())
+		.filter(Boolean);
+	return { subjectLine, bodyLines, rawFirstLine };
 }
 
 function isTooGeneric(message: string): boolean {
@@ -955,29 +996,33 @@ async function interruptGeneration(engine: Awaited<ReturnType<WebLLMModule['Crea
 }
 
 type NormalizeOptions = {
-	message: string;
+	subjectLine: string;
+	bodyLines: string[];
 	typeHint: string;
 	scopeHint: string;
 	requiredTokens: string[];
 	requiredTokenCount: number;
 	minSubjectLength: number;
+	maxSubjectLength: number;
 	diff: PreprocessResult;
 	promptConfig: PromptConfig;
 };
 
 function normalizeCommitMessage(options: NormalizeOptions): string {
-	const parsed = parseCommitMessage(options.message);
-	const subjectRaw = stripSubjectNoise(parsed.subject ?? options.message);
+	const parsed = parseCommitMessage(options.subjectLine);
+	const subjectRaw = stripSubjectNoise(parsed.subject ?? options.subjectLine);
 	const subject = ensureSpecificSubject({
 		subject: subjectRaw,
 		requiredTokens: options.requiredTokens,
 		requiredTokenCount: options.requiredTokenCount,
 		minSubjectLength: options.minSubjectLength,
+		maxSubjectLength: options.maxSubjectLength,
 		diff: options.diff,
 		promptConfig: options.promptConfig,
 	});
 	const scope = parsed.scope && parsed.scope.trim().length > 0 ? parsed.scope.trim() : options.scopeHint;
-	return formatCommitLine(options.typeHint, scope, subject);
+	const bodyLines = normalizeBodyLines(options.bodyLines, options.diff);
+	return formatCommitMessage(options.typeHint, scope, subject, bodyLines);
 }
 
 function parseCommitMessage(message: string): { type?: string; scope?: string; subject?: string } {
@@ -997,6 +1042,7 @@ function ensureSpecificSubject(options: {
 	requiredTokens: string[];
 	requiredTokenCount: number;
 	minSubjectLength: number;
+	maxSubjectLength: number;
 	diff: PreprocessResult;
 	promptConfig: PromptConfig;
 }): string {
@@ -1018,7 +1064,7 @@ function ensureSpecificSubject(options: {
 	if (options.minSubjectLength > 0 && cleaned.length < options.minSubjectLength) {
 		reasons.push('tooShort');
 	}
-	const needsFallback = reasons.length > 0;
+	const needsFallback = reasons.some(reason => reason !== 'tooShort');
 	debugLog('normalize', {
 		subject: cleaned,
 		requiredTokenCount: options.requiredTokenCount,
@@ -1027,6 +1073,7 @@ function ensureSpecificSubject(options: {
 		fallbackReasons: reasons,
 		usedFallback: needsFallback,
 		minSubjectLength: options.minSubjectLength,
+		maxSubjectLength: options.maxSubjectLength,
 	});
 	if (needsFallback) {
 		return buildSpecificSubject(
@@ -1034,11 +1081,19 @@ function ensureSpecificSubject(options: {
 			options.requiredTokens,
 			options.requiredTokenCount,
 			options.promptConfig,
-			options.minSubjectLength
+			options.minSubjectLength,
+			options.maxSubjectLength
 		);
 	}
-	const expanded = options.minSubjectLength > 0
-		? ensureSubjectLength(cleaned, options.diff, options.requiredTokens, options.promptConfig, options.minSubjectLength)
+	const expanded = options.minSubjectLength > 0 || options.maxSubjectLength > 0
+		? ensureSubjectLength(
+			cleaned,
+			options.diff,
+			options.requiredTokens,
+			options.promptConfig,
+			options.minSubjectLength,
+			options.maxSubjectLength
+		)
 		: cleaned;
 	return applySubjectStyle(expanded, options.promptConfig);
 }
@@ -1048,7 +1103,8 @@ function buildSpecificSubject(
 	requiredTokens: string[],
 	requiredTokenCount: number,
 	promptConfig: PromptConfig,
-	minSubjectLength: number
+	minSubjectLength: number,
+	maxSubjectLength: number
 ): string {
 	const tokens = requiredTokens.filter(Boolean);
 	const rankedFiles = [...diff.files].sort((a, b) => {
@@ -1081,16 +1137,16 @@ function buildSpecificSubject(
 			? `更新 ${primaryFragment} 与 ${secondPair}`
 			: `update ${primaryFragment} and ${secondPair}`;
 		return applySubjectStyle(
-			minSubjectLength > 0
-				? ensureSubjectLength(subject, diff, requiredTokens, promptConfig, minSubjectLength)
+			minSubjectLength > 0 || maxSubjectLength > 0
+				? ensureSubjectLength(subject, diff, requiredTokens, promptConfig, minSubjectLength, maxSubjectLength)
 				: subject,
 			promptConfig
 		);
 	}
 	subject = state.lang === 'zh' ? `更新 ${primaryFragment}` : `update ${primaryFragment}`;
 	return applySubjectStyle(
-		minSubjectLength > 0
-			? ensureSubjectLength(subject, diff, requiredTokens, promptConfig, minSubjectLength)
+		minSubjectLength > 0 || maxSubjectLength > 0
+			? ensureSubjectLength(subject, diff, requiredTokens, promptConfig, minSubjectLength, maxSubjectLength)
 			: subject,
 		promptConfig
 	);
@@ -1103,10 +1159,41 @@ function applySubjectStyle(subject: string, promptConfig: PromptConfig): string 
 	return subject;
 }
 
-function formatCommitLine(type: string, scope: string, subject: string): string {
+function formatCommitMessage(type: string, scope: string, subject: string, bodyLines: string[]): string {
 	const cleanSubject = subject.replace(/\s+/g, ' ').trim();
 	const prefix = `${type}(${scope}): `;
-	return `${prefix}${cleanSubject}`;
+	const head = `${prefix}${cleanSubject}`;
+	if (!bodyLines.length) {
+		return head;
+	}
+	const bullets = bodyLines.map(line => `- ${line}`);
+	return `${head}\n\n${bullets.join('\n')}`;
+}
+
+function normalizeBodyLines(bodyLines: string[], diff: PreprocessResult): string[] {
+	const cleaned = bodyLines
+		.map(line => line.replace(/\s+/g, ' ').trim())
+		.filter(Boolean)
+		.filter(line => !containsDiffStats(line))
+		.filter(line => !isTooGeneric(line));
+	const unique: string[] = [];
+	const seen = new Set<string>();
+	for (const line of cleaned) {
+		const key = line.toLowerCase();
+		if (!seen.has(key)) {
+			seen.add(key);
+			unique.push(line);
+		}
+	}
+	const enriched = unique.map(line => {
+		const file = findFileForLine(line, diff.files);
+		return ensureActionVerb(line, file);
+	});
+	if (enriched.length >= 8) {
+		return enriched.slice(0, 12);
+	}
+	const fallbackLines = buildBodyLines(diff, 8, 12);
+	return fallbackLines;
 }
 
 function buildRequiredTokens(files: FileSummary[]): string[] {
@@ -1206,6 +1293,7 @@ function containsDiffStats(subject: string): boolean {
 
 function stripSubjectNoise(subject: string): string {
 	return subject
+		.replace(/^subject:\s*/i, '')
 		.replace(/\(\+\d+\/-\d+\)/g, '')
 		.replace(/\+\d+\/-\d+/g, '')
 		.replace(/\s{2,}/g, ' ')
@@ -1242,21 +1330,54 @@ function ensureSubjectLength(
 	diff: PreprocessResult,
 	requiredTokens: string[],
 	promptConfig: PromptConfig,
-	minLength: number
+	minLength: number,
+	maxLength: number
 ): string {
-	if (minLength <= 0 || subject.length >= minLength) {
-		return subject;
+	let candidate = subject;
+	if (maxLength > 0 && candidate.length > maxLength) {
+		candidate = trimToMax(candidate, maxLength);
+	}
+	if (minLength <= 0 || candidate.length >= minLength) {
+		return candidate;
 	}
 	const fragments = buildDetailFragments(diff);
-	const tokenSnippet = requiredTokens.length ? ` ${requiredTokens.slice(0, 6).join(', ')}` : '';
-	const detailText = fragments.length ? fragments.join(state.lang === 'zh' ? '；' : '; ') : '';
-	const prefix = state.lang === 'zh' ? '，涉及：' : ' — details: ';
-	let expanded = `${subject}${prefix}${detailText}${tokenSnippet}`.replace(/\s+/g, ' ').trim();
-	if (expanded.length < minLength && fragments.length > 2) {
-		const extra = fragments.slice(0, 4).join(state.lang === 'zh' ? '；' : '; ');
-		expanded = `${subject}${prefix}${extra}${tokenSnippet}`.replace(/\s+/g, ' ').trim();
+	const tokenSnippet = requiredTokens.length ? ` ${requiredTokens.slice(0, 4).join(', ')}` : '';
+	const joiner = state.lang === 'zh' ? '；' : '; ';
+	const prefix = state.lang === 'zh' ? '，涉及：' : ' — ';
+	let appended = '';
+	for (const fragment of fragments) {
+		const next = appended ? `${appended}${joiner}${fragment}` : fragment;
+		const nextCandidate = `${candidate}${prefix}${next}${tokenSnippet}`.replace(/\s+/g, ' ').trim();
+		if (maxLength > 0 && nextCandidate.length > maxLength) {
+			break;
+		}
+		appended = next;
+	}
+	const expanded = appended
+		? `${candidate}${prefix}${appended}${tokenSnippet}`.replace(/\s+/g, ' ').trim()
+		: candidate;
+	if (minLength > 0 && expanded.length < minLength && tokenSnippet && !expanded.includes(tokenSnippet.trim())) {
+		const padded = `${expanded}${tokenSnippet}`.replace(/\s+/g, ' ').trim();
+		return maxLength > 0 ? trimToMax(padded, maxLength) : padded;
 	}
 	return expanded;
+}
+
+function trimToMax(value: string, maxLength: number): string {
+	if (maxLength <= 0 || value.length <= maxLength) {
+		return value;
+	}
+	const separators = [' — ', '，', ';', ',', ':'];
+	for (const separator of separators) {
+		const index = value.indexOf(separator);
+		if (index > 0 && index <= maxLength) {
+			const trimmed = value.slice(0, index).trim();
+			if (trimmed.length >= 10) {
+				return trimmed;
+			}
+		}
+	}
+	return value.slice(0, maxLength).replace(/[，,;:\-–—\s]+$/g, '').trim();
 }
 
 function buildDetailFragments(diff: PreprocessResult): string[] {
@@ -1273,6 +1394,178 @@ function buildDetailFragments(diff: PreprocessResult): string[] {
 		}
 	}
 	return fragments;
+}
+
+function buildBodyLines(diff: PreprocessResult, minLines: number, maxLines: number): string[] {
+	const rankedFiles = [...diff.files].sort((a, b) => {
+		const scoreA = (a.additions + a.deletions) || a.weight || 0;
+		const scoreB = (b.additions + b.deletions) || b.weight || 0;
+		return scoreB - scoreA;
+	});
+	const lines: string[] = [];
+	const seen = new Set<string>();
+	const detailBundles = rankedFiles.map(file => ({
+		file,
+		base: file.path.split('/').pop() ?? file.path,
+		details: collectFileDetails(file),
+	}));
+
+	for (const bundle of detailBundles) {
+		if (!bundle.details.length) {
+			continue;
+		}
+		const line = formatBodyLine(bundle.base, bundle.details, bundle.file);
+		pushUnique(lines, seen, line);
+		if (lines.length >= maxLines) {
+			break;
+		}
+	}
+
+	if (lines.length < minLines) {
+		for (const bundle of detailBundles) {
+			for (const detail of bundle.details) {
+				if (lines.length >= minLines) {
+					break;
+				}
+				const line = formatBodyLine(bundle.base, [detail], bundle.file);
+				pushUnique(lines, seen, line);
+			}
+			if (lines.length >= minLines) {
+				break;
+			}
+		}
+	}
+
+	if (lines.length < minLines) {
+		const fragments = buildDetailFragments(diff);
+		for (const fragment of fragments) {
+			if (lines.length >= minLines) {
+				break;
+			}
+			const extra = state.lang === 'zh' ? `更新 ${fragment}` : `Update ${fragment}`;
+			pushUnique(lines, seen, extra);
+		}
+	}
+
+	return lines.slice(0, maxLines).map(line => ensureActionVerb(line, undefined));
+}
+
+function pushUnique(lines: string[], seen: Set<string>, line: string) {
+	const trimmed = line.trim();
+	if (!trimmed) {
+		return;
+	}
+	const key = trimmed.toLowerCase();
+	if (!seen.has(key)) {
+		seen.add(key);
+		lines.push(trimmed);
+	}
+}
+
+function formatBodyLine(base: string, details: string[], file: FileSummary): string {
+	const action = pickActionVerb(file, details.join(' '));
+	const joiner = state.lang === 'zh' ? '、' : ', ';
+	const detailText = details.filter(Boolean).join(joiner);
+	if (state.lang === 'zh') {
+		return `${base}: ${action}${detailText}`.trim();
+	}
+	return `${base}: ${action} ${detailText}`.trim();
+}
+
+function ensureActionVerb(line: string, file?: FileSummary): string {
+	if (hasActionVerb(line)) {
+		return line;
+	}
+	const action = pickActionVerb(file, line);
+	if (!action) {
+		return line;
+	}
+	const colonIndex = line.indexOf(':');
+	if (colonIndex > -1 && colonIndex < line.length - 1) {
+		const head = line.slice(0, colonIndex + 1);
+		const tail = line.slice(colonIndex + 1).trim();
+		if (state.lang === 'zh') {
+			return `${head} ${action}${tail}`.trim();
+		}
+		return `${head} ${action} ${tail}`.trim();
+	}
+	return state.lang === 'zh' ? `${action}${line}` : `${action} ${line}`;
+}
+
+function hasActionVerb(line: string): boolean {
+	if (state.lang === 'zh') {
+		return /(新增|添加|更新|调整|修复|优化|完善|补充|支持|兼容|重构|避免|处理|规范|增强|移除|删除|重命名)/.test(line);
+	}
+	return /\b(add|create|update|adjust|fix|resolve|refine|improve|optimize|remove|rename|support|align|document|refactor|handle|guard|normalize|extend|clean)\b/i.test(line);
+}
+
+function pickActionVerb(file?: FileSummary, hint?: string): string {
+	const text = `${hint ?? ''} ${file?.highlights?.join(' ') ?? ''}`.toLowerCase();
+	if (/bug|fix|crash|issue/.test(text)) {
+		return state.lang === 'zh' ? '修复' : 'fix';
+	}
+	if (/perf|optimi[sz]e|latency|cache/.test(text)) {
+		return state.lang === 'zh' ? '优化' : 'optimize';
+	}
+	if (/doc|readme|docs/.test(text)) {
+		return state.lang === 'zh' ? '补充' : 'document';
+	}
+	if (/test|spec/.test(text)) {
+		return state.lang === 'zh' ? '更新' : 'update';
+	}
+	if (file?.changeType === 'added') {
+		return state.lang === 'zh' ? '新增' : 'add';
+	}
+	if (file?.changeType === 'deleted') {
+		return state.lang === 'zh' ? '删除' : 'remove';
+	}
+	if (file?.changeType === 'renamed') {
+		return state.lang === 'zh' ? '重命名' : 'rename';
+	}
+	return state.lang === 'zh' ? '更新' : 'update';
+}
+
+function findFileForLine(line: string, files: FileSummary[]): FileSummary | undefined {
+	const parts = line.split(':');
+	const head = parts[0]?.trim() ?? '';
+	if (!head) {
+		return undefined;
+	}
+	const lowerHead = head.toLowerCase();
+	return files.find(file => {
+		const base = file.path.split('/').pop()?.toLowerCase() ?? '';
+		return base && lowerHead.includes(base);
+	});
+}
+
+function collectFileDetails(file: FileSummary): string[] {
+	const details: string[] = [];
+	const addDetail = (value: string | undefined) => {
+		if (!value) {
+			return;
+		}
+		const trimmed = value.trim();
+		if (!trimmed) {
+			return;
+		}
+		if (!details.includes(trimmed)) {
+			details.push(trimmed);
+		}
+	};
+	for (const keyword of file.keywords?.slice(0, 3) ?? []) {
+		addDetail(keyword);
+	}
+	if (details.length < 3) {
+		addDetail(file.context?.[0]);
+	}
+	if (details.length < 3) {
+		const highlight = file.highlights?.find(item => !isGenericHighlight(item));
+		addDetail(highlight ? normalizeHighlight(highlight) : '');
+	}
+	if (details.length < 3) {
+		addDetail(inferDefaultAction(file.path));
+	}
+	return details.slice(0, 3);
 }
 
 function inferDefaultAction(filePath: string): string {
@@ -1313,18 +1606,26 @@ function normalizeHighlight(highlight: string): string {
 	return cleaned || highlight;
 }
 
-function generateFallbackMessage(diff: PreprocessResult, promptConfig: PromptConfig): string {
-	const topFile = diff.files[0];
-	const scope = topFile ? deriveScope(topFile.path) : 'repo';
-	const type = deriveType(diff);
-	const subject = deriveDetailedSubject(diff, promptConfig);
-	return `${type}(${scope}): ${subject}`;
+function buildFallbackOutput(diff: PreprocessResult, promptConfig: PromptConfig): { subjectLine: string; bodyLines: string[] } {
+	const subjectLine = deriveDetailedSubject(diff, promptConfig);
+	const bodyLines = buildBodyLines(diff, 8, 12);
+	return { subjectLine, bodyLines };
 }
 
 function applyPromptConfig(message: string, promptConfig: PromptConfig): string {
-	const withPrefix = promptConfig.prefix ? `${promptConfig.prefix} ${message}`.trim() : message.trim();
-	const withSuffix = promptConfig.suffix ? `${withPrefix} ${promptConfig.suffix}`.trim() : withPrefix;
-	return withSuffix;
+	const lines = message.split(/\r?\n/);
+	if (!lines.length) {
+		return message.trim();
+	}
+	let subjectLine = lines[0].trim();
+	if (promptConfig.prefix) {
+		subjectLine = `${promptConfig.prefix} ${subjectLine}`.trim();
+	}
+	if (promptConfig.suffix) {
+		subjectLine = `${subjectLine} ${promptConfig.suffix}`.trim();
+	}
+	lines[0] = subjectLine;
+	return lines.join('\n').trim();
 }
 
 function deriveDetailedSubject(diff: PreprocessResult, promptConfig: PromptConfig): string {
